@@ -17,11 +17,11 @@ WALLBOX_CSV = 'SessionsReport.csv'
 HOURLY_PV_ENDPOINT = "/seriescalc"
 TIMEZONE = 'Europe/London'
 TODAY = datetime.today()
-PERIOD_START_DATE = TODAY.replace(
-   year=TODAY.year - 1, day=1, hour=0, minute=0, second=0, microsecond=0
+REBASED_END_DATE = TODAY.replace(
+   day=1, hour=0, minute=0, second=0, microsecond=0
 )
-PERIOD_END_DATE = TODAY.replace(
-   month=TODAY.month, day=1, hour=0, minute=0, second=0, microsecond=0
+REBASED_START_DATE = TODAY.replace(
+   year=TODAY.year - 1, day=1, hour=0, minute=0, second=0, microsecond=0
 )
 LAT = 51.789115
 LON = -1.532447
@@ -35,26 +35,7 @@ SYSTEM_LOSS = 14.0
 ANGLE = 35.0
 # Orientation (azimuth) angle of the (fixed) plane, 0=south, 90=west, -90=east
 ASPECT = -35.0
-METER_PARAMETERS = {
-   'period_from': PERIOD_START_DATE,
-   'period_to': PERIOD_END_DATE,
-   'page_size': 25000,
-   'group_by': 'hour',
-}
-HOURLY_PV_PARAMETERS = {
-   'lat': LAT,
-   'lon': LON,
-   'startyear': SOLAR_OUTPUT_START_YEAR,
-   'endyear': SOLAR_OUTPUT_END_YEAR,
-   'pvcalculation': 1,
-   'peakpower': PEAK_POWER_KW,
-   'mountingplace': MOUNTING,
-   'loss': SYSTEM_LOSS,
-   'angle': ANGLE,
-   'aspect': ASPECT,
-   'outputformat': 'json'
-}
-QUANTUM_VALUE_DICT = {'energy_consumption': 'kWh'}
+QUANTUM_VALUE_DICT = {'energy': 'kWh'}
 INTERVAL_SECONDS_DICT = {'h': 3600}
 TRANSFORM_OCTOPUS_GROUP_DICT = {'hour': 'h', 'day': 'd', 'month': 'm'}
 OCTOPUS_INTERVAL_GROUP = 'hour'
@@ -62,28 +43,14 @@ WALLBOX_LABELS = {
    'en': {'start': 'Start', 'duration': 'Charging time (h:m:s)', 'quantity': 'Energy (kWh)'}
 }
 ENERGY_UNIT = 'kWh'
+REBASE_DATETIME_BY_YEAR = '1901'
+REBASE_DATETIME_BY_MONTH = '1902'
+REBASE_DATETIME_BY_DAY = '1903'
 
 
 # ----------------------CODE STARTS HERE----------------------
-# Use PVGIS API to get solar production history
-response = requests.get(
-   url=f"{PVGIS_URI}{HOURLY_PV_ENDPOINT}",
-   params=HOURLY_PV_PARAMETERS
-)
-response.raise_for_status()
-data = response.json()['outputs']['hourly']
-
-
-# Create and format df
-df_production = pd.DataFrame(data)
-df_production['time'] = pd.to_datetime(
-   df_production['time'].str[:-2], format='%Y%m%d:%H', utc=True
-)
-df_production.set_index('time', inplace=True)
-
-
 # Convert session based quantities to fixed time interval quantities
-def convert_sessions_to_fixed_intervals(sessions_df, sessions_quantity_label, sessions_duration_label, sessions_start_label, fixed_interval='h'):
+def convert_sessions_to_fixed_intervals(sessions_df, sessions_quantity_label, sessions_duration_label, sessions_start_label, fixed_interval):
     calculated_column = 'calculated_session_end'
 
     # Convert session duration to timedelta
@@ -164,27 +131,61 @@ def convert_sessions_to_fixed_intervals(sessions_df, sessions_quantity_label, se
     # Aggregate quantity data in dataframe for each fixed interval
     fixed_interval_df = fixed_interval_df.groupby(sessions_start_label).sum().reset_index()
 
+    return fixed_interval_df
+
+
+# Create PVGIS timeseries with fixed time intervals
+def create_pvgis_fixed_interval_df(peak_power, aspect, solar_start_year, solar_end_year, mounting, lat, lon, angle=35.0, system_loss=14.0, fixed_interval='h'):
+    # Declare constants
+    pv_endpoint = HOURLY_PV_ENDPOINT
+
+    # Use PVGIS API to get solar production history
+    response = requests.get(
+        url=f"{PVGIS_URI}{pv_endpoint}",
+        params={
+            'lat': lat,
+            'lon': lon,
+            'startyear': solar_start_year,
+            'endyear': solar_end_year,
+            'pvcalculation': 1,
+            'peakpower': peak_power,
+            'mountingplace': mounting,
+            'loss': system_loss,
+            'angle': angle,
+            'aspect': aspect,
+            'outputformat': 'json'
+        }
+    )
+    response.raise_for_status()
+    data = response.json()['outputs']['hourly']
+
+    # Create and format dataframe
+    data_df = pd.DataFrame(data)
+    data_df['time'] = pd.to_datetime(
+        data_df['time'].str[:-2], format='%Y%m%d:%H', utc=True
+    )
+
     return {
-        'fixed_interval_dataframe': fixed_interval_df,
-        'interval': fixed_interval
+        'dataframe': data_df,
+        'start_label': 'time',
+        'quantity_label': 'P'
     }
 
 
 # Create Octopus energy timeseries with fixed time intervals
-def create_octopus_energy_fixed_interval_df(electricity_mpan: int, electricity_serial_num, api_key, group_by_interval):
-    # Declare required constants
-    period_start_date = PERIOD_START_DATE
-    period_end_date = PERIOD_END_DATE
-    octopus_uri = OCTOPUS_URI
+def create_octopus_energy_fixed_interval_df(mpan: int, serial_num, api_key, fixed_interval='hour'):
+    # Declare constants
+    period_start_date = REBASED_START_DATE
+    period_end_date = REBASED_END_DATE
 
     # Call Octopus API to get electricity meter history
     response = requests.get(
-       url=f"{octopus_uri}/electricity-meter-points/{electricity_mpan}/meters/{electricity_serial_num}/consumption/",
+       url=f"{OCTOPUS_URI}/electricity-meter-points/{mpan}/meters/{serial_num}/consumption/",
        params={
            'period_from': period_start_date,
            'period_to': period_end_date,
            'page_size': 25000,
-           'group_by': group_by_interval,
+           'group_by': fixed_interval,
        },
        auth=(
            api_key, ""
@@ -207,13 +208,12 @@ def create_octopus_energy_fixed_interval_df(electricity_mpan: int, electricity_s
     return {
        'dataframe': data_df,
        'start_label': 'interval_start',
-       'quantity_label': 'consumption',
-       'fixed_interval': TRANSFORM_OCTOPUS_GROUP_DICT[group_by_interval]
+       'quantity_label': 'consumption'
     }
 
 
 # Create Wallbox timeseries with fixed time intervals
-def create_wallbox_fixed_interval_df(csv_file, timezone, time_interval='h', language_iso639='en'):
+def create_wallbox_fixed_interval_df(csv_file, timezone, fixed_interval='h', language_iso639='en'):
     # Declare required constants
     wallbox_quantity_label = WALLBOX_LABELS[language_iso639]['quantity']
     wallbox_duration_label = WALLBOX_LABELS[language_iso639]['duration']
@@ -239,9 +239,8 @@ def create_wallbox_fixed_interval_df(csv_file, timezone, time_interval='h', lang
        wallbox_quantity_label,
        wallbox_duration_label,
        wallbox_start_label,
-       time_interval
+       fixed_interval
     )
-    new_data_df = new_data_df['fixed_interval_dataframe']
 
     # Convert start time to localized UTC
     new_data_df[wallbox_start_label] = new_data_df[wallbox_start_label].dt.tz_localize(timezone)
@@ -250,12 +249,13 @@ def create_wallbox_fixed_interval_df(csv_file, timezone, time_interval='h', lang
     return {
        'dataframe': new_data_df,
        'start_label': wallbox_start_label,
-       'quantity_label': wallbox_quantity_label,
-       'fixed_interval': time_interval
+       'quantity_label': wallbox_quantity_label
     }
 
 
-def create_fixed_interval_meter(fixed_interval_df, meter_quantum, meter_interval='h'):
+# Create meter dataframe from fixed interval time series
+# Currently function ignores meter_interval but future use cases will aggregate
+def create_set_interval_meter(fixed_interval_df, meter_quantum, meter_set_interval='h'):
     # Add interval start time to dataframe index
     fixed_interval_df['dataframe'].set_index(
        fixed_interval_df['start_label'],
@@ -271,7 +271,26 @@ def create_fixed_interval_meter(fixed_interval_df, meter_quantum, meter_interval
        inplace=True
     )
 
-    return fixed_interval_df
+    # Placeholder for future code to logic check the dataframe fixed interval and desired set interval
+    set_interval_df = fixed_interval_df
+
+    return set_interval_df
+
+
+# Create a net meter from two meters with the same set interval
+def calc_net_meter(meter_one, meter_two):
+    # Infer meter one set interval
+    # Infer meter two set interval
+    # Compare set intervals and subtract meter two from meter one
+    net_meter = 'blank'
+    return net_meter
+
+
+# Convert full meter history to mean meter history by the set interval over a lookback period
+def calc_mean_meter_by_set_interval_over_lookback(meter, lookback_period='annual'):
+    meter.index = meter.index.map(lambda x: x.replace(year=REBASE_DATETIME_BY_YEAR))
+    mean_meter_by_set_interval = meter.groupby(meter.index).mean()
+    return {'dataframe': mean_meter_by_set_interval, 'lookback_period': lookback_period}
 
 
 # Create list of dataframes
@@ -280,29 +299,31 @@ wallbox_df = create_wallbox_fixed_interval_df(WALLBOX_CSV, TIMEZONE, 'h', 'en')
 fixed_interval_df_list.append(wallbox_df)
 octopus_df = create_octopus_energy_fixed_interval_df(ELECTRICITY_MPAN, ELECTRICITY_SERIAL, OCTOPUS_API_KEY, 'hour')
 fixed_interval_df_list.append(octopus_df)
+pvgis_df = create_pvgis_fixed_interval_df(PEAK_POWER_KW, ASPECT, SOLAR_OUTPUT_START_YEAR, SOLAR_OUTPUT_END_YEAR, MOUNTING, LAT, LON, ANGLE, SYSTEM_LOSS, 'h')
+fixed_interval_df_list.append(pvgis_df)
 
 
 # Create list of meters from list of dataframes
-fixed_interval_meters_list = []
-for fixed_interval_df in fixed_interval_df_list:
-    meter = create_fixed_interval_meter(fixed_interval_df, QUANTUM_VALUE_DICT['energy_consumption'])
-    fixed_interval_meters_list.append(meter)
+set_interval_meters_list = []
+for df in fixed_interval_df_list:
+    meter = create_set_interval_meter(df, QUANTUM_VALUE_DICT['energy'], 'h')
+    set_interval_meters_list.append(meter)
 
 
-fixed_interval_meter_comp = pd.concat(
+set_interval_meter_comp = pd.concat(
     [
-        fixed_interval_meters_list[0]['dataframe'][QUANTUM_VALUE_DICT['energy_consumption']],
-        fixed_interval_meters_list[1]['dataframe'][QUANTUM_VALUE_DICT['energy_consumption']]
+        set_interval_meters_list[0]['dataframe'][QUANTUM_VALUE_DICT['energy']],
+        set_interval_meters_list[1]['dataframe'][QUANTUM_VALUE_DICT['energy']]
     ],
     axis=1,
     keys=[
-        QUANTUM_VALUE_DICT['energy_consumption'],
-        QUANTUM_VALUE_DICT['energy_consumption']
+        QUANTUM_VALUE_DICT['energy'],
+        QUANTUM_VALUE_DICT['energy']
     ]
 )
 
 
-fixed_interval_meter_comp.to_csv('consumption_comp.csv', sep=',', index=True, encoding='utf-8')
+set_interval_meter_comp.to_csv('consumption_comp.csv', sep=',', index=True, encoding='utf-8')
 
 
 # Create meters side by side comparison
